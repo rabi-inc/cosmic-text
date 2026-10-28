@@ -18,6 +18,131 @@ use alloc::vec::Vec;
 use fontdb::Style;
 use self_cell::self_cell;
 
+/// Code point ranges that cover every character the shaper can map from the character map.
+///
+/// The union of the Unicode subtables in format 4 and 12, so it holds whichever of them the shaper
+/// picks. The ranges may cover characters the font does not map; they never miss one it maps.
+/// `None` when the cmap has a subtable the shaper may read that is not bounded here: a symbol or
+/// Mac Roman subtable (the shaper remaps characters into them) or another format.
+fn cmap_ranges(cmap: &skrifa::raw::tables::cmap::Cmap<'_>) -> Option<Vec<(u32, u32)>> {
+    use skrifa::raw::tables::cmap::{CmapSubtable, PlatformId};
+
+    let data = cmap.offset_data();
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for record in cmap.encoding_records() {
+        let symbol = record.platform_id() == PlatformId::Windows && record.encoding_id() == 0;
+        if symbol || record.platform_id() == PlatformId::Macintosh {
+            return None;
+        }
+        match record.subtable(data).ok()? {
+            CmapSubtable::Format4(table) => ranges.extend(
+                table
+                    .start_code()
+                    .iter()
+                    .zip(table.end_code())
+                    .map(|(start, end)| (u32::from(start.get()), u32::from(end.get()))),
+            ),
+            CmapSubtable::Format12(table) => ranges.extend(
+                table
+                    .groups()
+                    .iter()
+                    .map(|group| (group.start_char_code(), group.end_char_code())),
+            ),
+            // Variation sequences resolve to a base character the other subtables map.
+            CmapSubtable::Format14(_) => {}
+            _ => return None,
+        }
+    }
+    ranges.sort_unstable();
+    // Merge overlapping ranges so a binary search finds the one that holds a character.
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1.saturating_add(1) => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    Some(merged)
+}
+
+#[cfg(test)]
+mod cmap_ranges_tests {
+    use super::cmap_ranges;
+    use skrifa::raw::{tables::cmap::Cmap, FontRead};
+
+    fn u16s(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    fn u32s(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    /// Format 4 with one segment `start..=end` and the closing 0xFFFF segment.
+    fn format4(start: u16, end: u16) -> Vec<u8> {
+        let mut body = u16s(&[4, 32, 0, 4, 4, 1, 0]);
+        body.extend(u16s(&[end, 0xFFFF, 0, start, 0xFFFF, 1, 1, 0, 0]));
+        body
+    }
+
+    /// Format 12 or 13 with one group `start..=end`.
+    fn format12(format: u16, start: u32, end: u32) -> Vec<u8> {
+        let mut body = u16s(&[format, 0]);
+        body.extend(u32s(&[28, 0, 1, start, end, 1]));
+        body
+    }
+
+    fn format0() -> Vec<u8> {
+        let mut body = u16s(&[0, 262, 0]);
+        body.extend([0u8; 256]);
+        body
+    }
+
+    fn cmap(subtables: &[((u16, u16), Vec<u8>)]) -> Vec<u8> {
+        let mut out = u16s(&[0, subtables.len() as u16]);
+        let mut offset = 4 + 8 * subtables.len() as u32;
+        for ((platform, encoding), body) in subtables {
+            out.extend(u16s(&[*platform, *encoding]));
+            out.extend(u32s(&[offset]));
+            offset += body.len() as u32;
+        }
+        for (_, body) in subtables {
+            out.extend(body);
+        }
+        out
+    }
+
+    fn ranges(subtables: &[((u16, u16), Vec<u8>)]) -> Option<Vec<(u32, u32)>> {
+        let bytes = cmap(subtables);
+        let cmap = Cmap::read(bytes.as_slice().into()).expect("cmap");
+        cmap_ranges(&cmap)
+    }
+
+    #[test]
+    fn unicode_subtables_give_the_union_of_their_ranges() {
+        assert_eq!(
+            ranges(&[
+                ((3, 1), format4(0x41, 0x5A)),
+                ((3, 10), format12(12, 0x1_F600, 0x1_F64F)),
+            ]),
+            Some(vec![(0x41, 0x5A), (0xFFFF, 0xFFFF), (0x1_F600, 0x1_F64F)])
+        );
+    }
+
+    #[test]
+    fn subtables_the_shaper_remaps_or_reads_otherwise_are_unbounded() {
+        assert_eq!(ranges(&[((0, 4), format12(13, 0, 0x10_FFFF))]), None);
+        assert_eq!(
+            ranges(&[
+                ((3, 0), format4(0xF020, 0xF0FF)),
+                ((3, 1), format4(0x41, 0x5A))
+            ]),
+            None
+        );
+        assert_eq!(ranges(&[((1, 0), format0())]), None);
+    }
+}
+
 pub mod fallback;
 pub use fallback::{Fallback, PlatformFallback};
 
@@ -54,6 +179,9 @@ pub struct Font {
     data: FontData,
     id: fontdb::ID,
     monospace_fallback: Option<FontMonospaceFallback>,
+    /// Sorted, disjoint code point ranges that cover every character the shaper can map, or `None`
+    /// when they cannot be bounded (see [`cmap_ranges`]).
+    cmap_ranges: Option<Vec<(u32, u32)>>,
     pub(crate) italic_or_oblique: bool,
 }
 
@@ -88,6 +216,25 @@ impl Font {
 
     pub fn data(&self) -> &[u8] {
         self.data.data.data()
+    }
+
+    /// Whether the shaper may find a glyph for `c` in the character map of the font. `false` only
+    /// when the character is outside every range of the subtable the shaper reads.
+    pub(crate) fn may_map(&self, c: char) -> bool {
+        self.cmap_ranges.as_ref().is_none_or(|ranges| {
+            let c = u32::from(c);
+            ranges
+                .binary_search_by(|&(start, end)| {
+                    if end < c {
+                        core::cmp::Ordering::Less
+                    } else if start > c {
+                        core::cmp::Ordering::Greater
+                    } else {
+                        core::cmp::Ordering::Equal
+                    }
+                })
+                .is_ok()
+        })
     }
 
     pub fn shaper(&self) -> &harfrust::Shaper<'_> {
@@ -204,9 +351,12 @@ impl Font {
             )
         };
 
+        let cmap_ranges = font_ref.cmap().ok().and_then(|cmap| cmap_ranges(&cmap));
+
         Some(Self {
             id: info.id,
             monospace_fallback,
+            cmap_ranges,
             #[cfg(feature = "swash")]
             swash: {
                 let swash = swash::FontRef::from_index((*data).as_ref(), info.index as usize)?;

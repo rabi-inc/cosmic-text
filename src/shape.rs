@@ -323,11 +323,19 @@ fn shape_run(
         )
     };
 
+    let filter = !missing.is_empty()
+        && !span_rtl
+        && coverage::filterable(&line[start_run..end_run], &scripts);
+
     //TODO: improve performance!
     while !missing.is_empty() {
         let Some(font) = font_iter.next() else {
             break;
         };
+
+        if filter && !coverage::covers_any(&font, line, &missing) {
+            continue;
+        }
 
         log::trace!(
             "Evaluating fallback with font '{}'",
@@ -411,6 +419,135 @@ fn shape_run(
 
     // Restore the scripts buffer.
     font_system.shape_buffer.scripts = scripts;
+}
+
+/// Skips fallback fonts that cannot fill any missing cluster.
+///
+/// `shape_run` shapes the whole run with each fallback font and keeps a fallback glyph only for a
+/// cluster that is still missing and for which the fallback produced a non-zero glyph. In a
+/// left-to-right run of plain characters, a font produces a non-zero glyph at a cluster only if its
+/// character map has the first character of that cluster, so a font that has none of them changes
+/// nothing and is skipped. Runs where the shaper can produce a glyph without that mapping
+/// (decomposition, combining marks, variation selectors, joiners, mirroring in right-to-left runs)
+/// are left to the unfiltered path.
+mod coverage {
+    use unicode_normalization::char::{decompose_canonical, is_combining_mark};
+    use unicode_script::Script;
+
+    use crate::Font;
+
+    /// A character the shaper may render without a character map entry for it: it decomposes,
+    /// combines, selects a variant, joins, is invisible, or falls back to another space or hyphen.
+    fn special(c: char) -> bool {
+        let mut decomposes = false;
+        decompose_canonical(c, |part| decomposes |= part != c);
+        decomposes
+            || is_combining_mark(c)
+            || c.is_control() && c != '\t'
+            || c.is_whitespace() && c != ' ' && c != '\t'
+            || matches!(
+                c,
+                '\u{00AD}'
+                    | '\u{034F}'
+                    | '\u{061C}'
+                    | '\u{115F}'..='\u{1160}'
+                    | '\u{17B4}'..='\u{17B5}'
+                    | '\u{180B}'..='\u{180F}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{2011}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{206F}'
+                    | '\u{3164}'
+                    | '\u{FE00}'..='\u{FE0F}'
+                    | '\u{FEFF}'
+                    | '\u{FFA0}'
+                    | '\u{FFF0}'..='\u{FFFB}'
+                    | '\u{1BCA0}'..='\u{1BCA3}'
+                    | '\u{1D173}'..='\u{1D17A}'
+                    | '\u{E0000}'..='\u{E0FFF}'
+            )
+    }
+
+    /// Whether the fallback fonts of `run` can be filtered by character map coverage alone.
+    ///
+    /// `scripts` holds the scripts of `run` other than Common, Inherited, Latin and Unknown.
+    pub(super) fn filterable(run: &str, scripts: &[Script]) -> bool {
+        scripts.iter().all(|script| {
+            matches!(
+                script,
+                Script::Han
+                    | Script::Hiragana
+                    | Script::Katakana
+                    | Script::Greek
+                    | Script::Cyrillic
+            )
+        }) && !run.chars().any(special)
+    }
+
+    /// Whether `font` maps the first character of any missing cluster. `missing` holds the byte
+    /// offsets of the clusters in `line`.
+    pub(super) fn covers_any(font: &Font, line: &str, missing: &[usize]) -> bool {
+        missing.iter().any(|&start| {
+            line[start..].chars().next().is_some_and(|c| {
+                // `shape_fallback` shapes a tab as a space.
+                let c = if c == '\t' { ' ' } else { c };
+                font.may_map(c)
+            })
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{covers_any, filterable};
+        use crate::{fontdb, Font};
+        use unicode_script::{Script, UnicodeScript};
+
+        fn scripts(run: &str) -> Vec<Script> {
+            let mut out = Vec::new();
+            for script in run.chars().map(|c| c.script()) {
+                match script {
+                    Script::Common | Script::Inherited | Script::Latin | Script::Unknown => {}
+                    script if !out.contains(&script) => out.push(script),
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn runs_the_shaper_can_fill_without_a_mapping_are_not_filtered() {
+            for (run, expected) in [
+                ("漢字かなカナ", true),
+                ("Привет αβγ", true),
+                ("a\tb", true),
+                ("한글", false),
+                ("שלום", false),
+                ("❤\u{FE0F}", false),
+                ("👩\u{200D}💻", false),
+                ("葛\u{E0100}", false),
+                ("\u{F900}", false),
+                ("e\u{0301}", false),
+                ("a\u{2011}b", false),
+                ("a\u{3000}b", false),
+            ] {
+                assert_eq!(filterable(run, &scripts(run)), expected, "{run:?}");
+            }
+        }
+
+        #[test]
+        fn a_font_covers_the_run_if_it_maps_any_missing_cluster() {
+            let mut db = fontdb::Database::new();
+            let fonts = concat!(env!("CARGO_MANIFEST_DIR"), "/fonts");
+            db.load_font_data(
+                std::fs::read(format!("{fonts}/NotoSansHebrew.ttf")).expect("font fixture"),
+            );
+            let id = db.faces().next().expect("face").id;
+            let hebrew = Font::new(&db, id, fontdb::Weight::NORMAL).expect("font");
+            let line = "Пש";
+            assert!(!covers_any(&hebrew, line, &[0]));
+            assert!(covers_any(&hebrew, line, &[0, "П".len()]));
+        }
+    }
 }
 
 #[cfg(feature = "shape-run-cache")]
