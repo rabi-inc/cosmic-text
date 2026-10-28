@@ -290,6 +290,11 @@ impl FontSystem {
     /// Get a mutable reference to the database.
     pub fn db_mut(&mut self) -> &mut fontdb::Database {
         self.font_matches_cache.clear();
+        // Cached runs hold glyphs of the fonts chosen from the current set; the key does not.
+        #[cfg(feature = "shape-run-cache")]
+        {
+            self.shape_run_cache = crate::ShapeRunCache::default();
+        }
         &mut self.db
     }
 
