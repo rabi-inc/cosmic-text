@@ -428,6 +428,7 @@ fn shape_run_cached(
     let run_range = start_run..end_run;
     let mut key = ShapeRunKey {
         text: line[run_range.clone()].to_string(),
+        rtl: span_rtl,
         default_attrs: AttrsOwned::new(&attrs_list.defaults()),
         attrs_spans: Vec::new(),
     };

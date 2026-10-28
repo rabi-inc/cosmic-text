@@ -8,6 +8,9 @@ use crate::{AttrsOwned, HashMap, ShapeGlyph};
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct ShapeRunKey {
     pub text: String,
+    /// The direction the run was shaped in. The same text shapes differently in each direction
+    /// (for example, mirrored brackets in a right-to-left run).
+    pub rtl: bool,
     pub default_attrs: AttrsOwned,
     pub attrs_spans: Vec<(Range<usize>, AttrsOwned)>,
 }
