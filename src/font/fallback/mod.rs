@@ -191,6 +191,11 @@ pub struct FontFallbackIter<'a> {
     word: &'a str,
     script_i: (usize, usize),
     common_i: usize,
+    /// Next index into `font_match_keys` while walking the faces of the current family.
+    family_key_i: usize,
+    /// Faces already returned, so a face reached again through a later family or the final
+    /// sweep is not shaped twice.
+    returned: Vec<fontdb::ID>,
     other_i: usize,
     end: bool,
     ideal_weight: fontdb::Weight,
@@ -218,6 +223,8 @@ impl<'a> FontFallbackIter<'a> {
             word,
             script_i: (0, 0),
             common_i: 0,
+            family_key_i: 0,
+            returned: Vec::new(),
             other_i: 0,
             end: false,
             ideal_weight,
@@ -274,6 +281,30 @@ impl<'a> FontFallbackIter<'a> {
             .db()
             .face(id)
             .is_some_and(|face| face.families.iter().any(|(name, _)| name == family_name))
+    }
+
+    /// The next face of `family_name` matching the ideal weight, in `font_match_keys` order.
+    ///
+    /// A family can hold several faces of the same weight and style (a font split into
+    /// unicode-range slices). Each call returns the next one, so the family is exhausted before
+    /// the caller moves on to the next family. Returns `None` (and rewinds) once exhausted.
+    fn next_face_of_family(&mut self, family_name: &str) -> Option<Arc<Font>> {
+        while self.family_key_i < self.font_match_keys.len() {
+            let m_key = self.font_match_keys[self.family_key_i];
+            self.family_key_i += 1;
+            if !(m_key.font_weight_diff == 0 || m_key.variable_weight_match)
+                || self.returned.contains(&m_key.id)
+                || !self.face_contains_family(m_key.id, family_name)
+            {
+                continue;
+            }
+            if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
+                self.returned.push(m_key.id);
+                return Some(font);
+            }
+        }
+        self.family_key_i = 0;
+        None
     }
 
     fn default_font_match_key(&self) -> Option<&FontMatchKey> {
@@ -339,8 +370,12 @@ impl<'a> FontFallbackIter<'a> {
                     );
                     break 'DEF_FAM;
                 }
-                (false, Some(m_key)) => {
-                    if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
+                (false, Some(_)) => {
+                    let default_family = self.default_families[self.default_i - 1];
+                    let family_name = self.font_system.db().family_name(default_family).to_owned();
+                    if let Some(font) = self.next_face_of_family(&family_name) {
+                        // Stay on this family until all of its faces have been returned.
+                        self.default_i -= 1;
                         return Some(font);
                     }
                     break 'DEF_FAM;
@@ -430,14 +465,10 @@ impl<'a> FontFallbackIter<'a> {
 
             while self.script_i.1 < script_families.len() {
                 let script_family = script_families[self.script_i.1];
-                self.script_i.1 += 1;
-                for m_key in font_match_keys_iter(false) {
-                    if self.face_contains_family(m_key.id, script_family) {
-                        if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
-                            return Some(font);
-                        }
-                    }
+                if let Some(font) = self.next_face_of_family(script_family) {
+                    return Some(font);
                 }
+                self.script_i.1 += 1;
                 log::debug!(
                     "failed to find family '{}' for script {:?} and locale '{}'",
                     script_family,
@@ -453,14 +484,10 @@ impl<'a> FontFallbackIter<'a> {
         let common_families = fallbacks.common_fallback();
         while self.common_i < common_families.len() {
             let common_family = common_families[self.common_i];
-            self.common_i += 1;
-            for m_key in font_match_keys_iter(false) {
-                if self.face_contains_family(m_key.id, common_family) {
-                    if let Some(font) = self.font_system.get_font(m_key.id, self.ideal_weight) {
-                        return Some(font);
-                    }
-                }
+            if let Some(font) = self.next_face_of_family(common_family) {
+                return Some(font);
             }
+            self.common_i += 1;
             log::debug!("failed to find family '{common_family}'");
         }
 
@@ -470,9 +497,10 @@ impl<'a> FontFallbackIter<'a> {
         while self.other_i < self.font_match_keys.len() {
             let id = self.font_match_keys[self.other_i].id;
             self.other_i += 1;
-            if forbidden_families
-                .iter()
-                .all(|family_name| !self.face_contains_family(id, family_name))
+            if !self.returned.contains(&id)
+                && forbidden_families
+                    .iter()
+                    .all(|family_name| !self.face_contains_family(id, family_name))
             {
                 if let Some(font) = self.font_system.get_font(id, self.ideal_weight) {
                     return Some(font);
